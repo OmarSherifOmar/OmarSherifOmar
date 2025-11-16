@@ -2,18 +2,19 @@ name: Generate pacman animation
 
 on:
   schedule:
-    - cron: "0 */12 * * *"  # every 12 hours at minute 0
+    - cron: "0 */12 * * *"  # every 12 hours
   workflow_dispatch:
   push:
     branches:
       - main
 
+permissions:
+  contents: write
+
 jobs:
   generate:
-    permissions:
-      contents: write
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
@@ -27,33 +28,97 @@ jobs:
           mkdir -p dist
 
       - name: Generate pacman-contribution-graph (action)
-        # This action generates SVG(s) in the runner workspace root (expected)
+        id: gen
+        # keep your generator action here
         uses: abozanona/pacman-contribution-graph@main
         with:
           github_user_name: ${{ github.repository_owner }}
-        # If the action requires additional inputs change above accordingly
 
-      - name: Collect generated SVG files into dist
+      - name: List workspace (debug)
+        run: ls -la
+
+      - name: Collect generated SVG files into dist (robust)
         run: |
-          # Adjust these names if the generator writes different filenames.
-          # We attempt to move common output names into dist/
-          if [ -f "pacman-contribution-graph.svg" ]; then mv pacman-contribution-graph.svg dist/; fi
-          if [ -f "pacman-contribution-graph-dark.svg" ]; then mv pacman-contribution-graph-dark.svg dist/; fi
-          # Some versions write into ./output or ./dist already. Move likely candidates:
-          if [ -d "output" ]; then mv output/* dist/ || true; fi
-          if [ -d "dist" ]; then echo "dist exists"; fi
+          set -e
+          echo "Looking for generated files..."
+          # try many likely filenames / folders and move to dist/
+          patterns="pacman-contribution-graph.svg pacman-contribution-graph-dark.svg pacman_contributions.svg pacman-contributions-dark.svg pacman* pacman-* pacman_contribution* pacman_contributions*"
+          for p in $patterns; do
+            for f in $(ls -1 $p 2>/dev/null || true); do
+              echo "moving $f -> dist/"
+              mv "$f" dist/ || true
+            done
+          done
+          # also move contents if the action placed files in ./output or ./dist-out
+          if [ -d "output" ]; then
+            echo "moving output/* -> dist/"
+            mv output/* dist/ || true
+          fi
+          if [ -d "dist-out" ]; then
+            echo "moving dist-out/* -> dist/"
+            mv dist-out/* dist/ || true
+          fi
+          echo "Dist contents:"
           ls -la dist || true
 
-      - name: Commit debug info (optional)
-        if: always()
+      - name: Show dist contents (logs)
         run: |
-          echo "Generated files in dist:"
-          ls -la dist
+          echo "=== dist contents ==="
+          ls -la dist || true
+          echo "=== head of dist files (first file shown) ==="
+          FIRST=$(ls dist | head -n1 || true)
+          if [ -n "$FIRST" ]; then
+            echo "Showing head of dist/$FIRST"
+            sed -n '1,120p' "dist/$FIRST" || true
+          else
+            echo "No file in dist"
+          fi
 
-      - name: Push pacman-contribution-graph.svg to the output branch
-        uses: crazy-max/ghaction-github-pages@v3.1.0
-        with:
-          target_branch: output
-          build_dir: dist
+      - name: Commit dist to output branch (push to output)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # create a temporary orphan branch containing only dist contents
+          git checkout --orphan temp-output
+          git --work-tree=dist add --all
+          if git --work-tree=dist diff --cached --quiet; then
+            echo "Nothing to commit to output"
+          else
+            git --work-tree=dist commit -m "Update pacman SVGs [ci skip]" || true
+            # push to output branch (force update)
+            git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" HEAD:output
+          fi
+          # go back to main branch
+          git checkout -f main
+
+      - name: Copy latest SVG to repo root and push to main (so README ./pacman_contributions.svg works)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          # find a candidate SVG in dist
+          CAND=$(ls dist/*.svg 2>/dev/null | head -n1 || true)
+          if [ -z "$CAND" ]; then
+            echo "No SVG found in dist to copy to repo root; aborting copy-to-main step."
+            exit 0
+          fi
+          echo "Copying $CAND -> pacman_contributions.svg"
+          cp "$CAND" pacman_contributions.svg || true
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Ensure we can push to main using token-authenticated remote
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+
+          # Only commit if file changed
+          if git status --porcelain | grep -q "pacman_contributions.svg"; then
+            git add pacman_contributions.svg
+            git commit -m "Update pacman_contributions.svg [ci skip]" || echo "git commit returned non-zero"
+            git push origin HEAD:main
+          else
+            echo "pacman_contributions.svg not modified; nothing to commit."
+          fi
